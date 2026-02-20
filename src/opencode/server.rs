@@ -336,23 +336,60 @@ impl OpenCodeServer {
         request: &SendPromptRequest,
     ) -> anyhow::Result<serde_json::Value> {
         let url = format!("{}/session/{}/message", self.base_url, session_id);
+        let directory = self.directory.to_str().unwrap_or(".");
 
         let response = self.client
             .post(&url)
-            .query(&[("directory", self.directory.to_str().unwrap_or("."))])
+            .query(&[("directory", directory)])
             .json(request)
             .send()
             .await
             .context("failed to send prompt to OpenCode session")?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            bail!("send prompt failed ({status}): {text}");
+        if response.status().is_success() {
+            return response
+                .json::<serde_json::Value>()
+                .await
+                .context("failed to parse prompt response");
         }
 
-        response.json::<serde_json::Value>().await
-            .context("failed to parse prompt response")
+        let primary_status = response.status();
+        let primary_text = response.text().await.unwrap_or_default();
+
+        // Compatibility fallback for older OpenCode versions that expect
+        // model keys as providerId/modelId instead of providerID/modelID.
+        if primary_status == reqwest::StatusCode::BAD_REQUEST {
+            if let Some(legacy_request) = request_with_legacy_model_case(request) {
+                tracing::debug!(
+                    session_id,
+                    "send prompt rejected, retrying with legacy model key casing"
+                );
+
+                let fallback_response = self
+                    .client
+                    .post(&url)
+                    .query(&[("directory", directory)])
+                    .json(&legacy_request)
+                    .send()
+                    .await
+                    .context("failed to send prompt fallback request")?;
+
+                if fallback_response.status().is_success() {
+                    return fallback_response
+                        .json::<serde_json::Value>()
+                        .await
+                        .context("failed to parse prompt response");
+                }
+
+                let fallback_status = fallback_response.status();
+                let fallback_text = fallback_response.text().await.unwrap_or_default();
+                bail!(
+                    "send prompt failed ({primary_status}): {primary_text}; legacy model fallback failed ({fallback_status}): {fallback_text}"
+                );
+            }
+        }
+
+        bail!("send prompt failed ({primary_status}): {primary_text}")
     }
 
     /// Send a prompt asynchronously (returns immediately, use SSE events for results).
@@ -362,22 +399,54 @@ impl OpenCodeServer {
         request: &SendPromptRequest,
     ) -> anyhow::Result<()> {
         let url = format!("{}/session/{}/prompt_async", self.base_url, session_id);
+        let directory = self.directory.to_str().unwrap_or(".");
 
         let response = self.client
             .post(&url)
-            .query(&[("directory", self.directory.to_str().unwrap_or("."))])
+            .query(&[("directory", directory)])
             .json(request)
             .send()
             .await
             .context("failed to send async prompt")?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            bail!("async prompt failed ({status}): {text}");
+        if response.status().is_success() {
+            return Ok(());
         }
 
-        Ok(())
+        let primary_status = response.status();
+        let primary_text = response.text().await.unwrap_or_default();
+
+        // Compatibility fallback for older OpenCode versions that expect
+        // model keys as providerId/modelId instead of providerID/modelID.
+        if primary_status == reqwest::StatusCode::BAD_REQUEST {
+            if let Some(legacy_request) = request_with_legacy_model_case(request) {
+                tracing::debug!(
+                    session_id,
+                    "async prompt rejected, retrying with legacy model key casing"
+                );
+
+                let fallback_response = self
+                    .client
+                    .post(&url)
+                    .query(&[("directory", directory)])
+                    .json(&legacy_request)
+                    .send()
+                    .await
+                    .context("failed to send async prompt fallback request")?;
+
+                if fallback_response.status().is_success() {
+                    return Ok(());
+                }
+
+                let fallback_status = fallback_response.status();
+                let fallback_text = fallback_response.text().await.unwrap_or_default();
+                bail!(
+                    "async prompt failed ({primary_status}): {primary_text}; legacy model fallback failed ({fallback_status}): {fallback_text}"
+                );
+            }
+        }
+
+        bail!("async prompt failed ({primary_status}): {primary_text}")
     }
 
     /// Abort a session.
@@ -401,29 +470,69 @@ impl OpenCodeServer {
     }
 
     /// Reply to a permission request.
+    ///
+    /// Tries the current OpenCode endpoint first:
+    /// `POST /session/{id}/permissions/{permissionID}` with `{ response }` body.
+    /// Falls back to the legacy endpoint for older OpenCode versions:
+    /// `POST /permission/{id}/reply` with `{ reply, message }` body.
     pub async fn reply_permission(
         &self,
-        request_id: &str,
+        session_id: &str,
+        permission_id: &str,
         reply: PermissionReply,
     ) -> anyhow::Result<()> {
-        let url = format!("{}/permission/{}/reply", self.base_url, request_id);
-        let body = PermissionReplyRequest {
+        let directory = self.directory.to_str().unwrap_or(".");
+
+        let modern_url = format!(
+            "{}/session/{}/permissions/{}",
+            self.base_url, session_id, permission_id
+        );
+        let modern_body = serde_json::json!({
+            "response": reply.as_api_str(),
+        });
+
+        let modern_response = self.client
+            .post(&modern_url)
+            .query(&[("directory", directory)])
+            .json(&modern_body)
+            .send()
+            .await
+            .context("failed to reply to permission (modern endpoint)")?;
+
+        if modern_response.status().is_success() {
+            return Ok(());
+        }
+
+        let modern_status = modern_response.status();
+        let modern_text = modern_response.text().await.unwrap_or_default();
+
+        tracing::debug!(
+            session_id,
+            permission_id,
+            status = %modern_status,
+            "modern permission reply endpoint failed, trying legacy endpoint"
+        );
+
+        let legacy_url = format!("{}/permission/{}/reply", self.base_url, permission_id);
+        let legacy_body = PermissionReplyRequest {
             reply,
             message: None,
         };
 
-        let response = self.client
-            .post(&url)
-            .query(&[("directory", self.directory.to_str().unwrap_or("."))])
-            .json(&body)
+        let legacy_response = self.client
+            .post(&legacy_url)
+            .query(&[("directory", directory)])
+            .json(&legacy_body)
             .send()
             .await
-            .context("failed to reply to permission")?;
+            .context("failed to reply to permission (legacy endpoint)")?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            bail!("permission reply failed ({status}): {text}");
+        if !legacy_response.status().is_success() {
+            let legacy_status = legacy_response.status();
+            let legacy_text = legacy_response.text().await.unwrap_or_default();
+            bail!(
+                "permission reply failed: modern ({modern_status}) {modern_text}; legacy ({legacy_status}) {legacy_text}"
+            );
         }
 
         Ok(())
@@ -634,4 +743,31 @@ fn port_for_directory(directory: &Path) -> u16 {
     let hash = hasher.finish();
     // Map into range 10000..60000 (50000 ports)
     10000 + (hash % 50000) as u16
+}
+
+/// Build a request body that uses legacy lower-camel model keys.
+///
+/// Some OpenCode versions expect `providerId`/`modelId` while newer builds
+/// expect `providerID`/`modelID`. This helper rewrites only the model object.
+fn request_with_legacy_model_case(
+    request: &SendPromptRequest,
+) -> Option<serde_json::Value> {
+    if request.model.is_none() {
+        return None;
+    }
+
+    let mut body = serde_json::to_value(request).ok()?;
+    let model = body.get_mut("model")?.as_object_mut()?;
+
+    let provider = model
+        .remove("providerID")
+        .or_else(|| model.remove("providerId"))?;
+    let model_id = model
+        .remove("modelID")
+        .or_else(|| model.remove("modelId"))?;
+
+    model.insert("providerId".to_string(), provider);
+    model.insert("modelId".to_string(), model_id);
+
+    Some(body)
 }

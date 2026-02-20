@@ -76,7 +76,7 @@ Spacebot subscribes to the SSE stream and processes:
 - **Tool events** — translated to `set_status` updates (e.g. "running: bash", "running: edit")
 - **Session idle** — signals task completion
 - **Session error** — signals failure
-- **Permission asked** — auto-approved (configurable)
+- **Permission updated/asked** — auto-approved (configurable, supports both API versions)
 - **Question asked** — auto-selects first option
 - **Retry status** — reports rate limit retries
 
@@ -140,6 +140,8 @@ coding = "anthropic/claude-sonnet-4-20250514"
 ```
 
 When the worker spawns, the routing config determines the model. The model string is split into `provider_id/model_id` and passed to OpenCode's prompt API.
+
+If OpenCode rejects the configured override (for example `Model not found`), Spacebot retries that prompt once using OpenCode's default model selection for the session.
 
 ## Full Configuration
 

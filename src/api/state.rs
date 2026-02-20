@@ -128,6 +128,23 @@ pub enum ApiEvent {
         worker_id: String,
         status: String,
     },
+    /// A worker requested permission for an operation.
+    WorkerPermission {
+        agent_id: String,
+        channel_id: Option<String>,
+        worker_id: String,
+        permission_id: String,
+        description: String,
+        patterns: Vec<String>,
+    },
+    /// A worker asked a question requiring an answer.
+    WorkerQuestion {
+        agent_id: String,
+        channel_id: Option<String>,
+        worker_id: String,
+        question_id: String,
+        questions: Vec<crate::opencode::QuestionInfo>,
+    },
     /// A worker completed.
     WorkerCompleted {
         agent_id: String,
@@ -273,6 +290,38 @@ impl ApiState {
                                     channel_id: channel_id.as_deref().map(|s| s.to_string()),
                                     worker_id: worker_id.to_string(),
                                     status: status.clone(),
+                                }).ok();
+                            }
+                            ProcessEvent::WorkerPermission {
+                                worker_id,
+                                channel_id,
+                                permission_id,
+                                description,
+                                patterns,
+                                ..
+                            } => {
+                                api_tx.send(ApiEvent::WorkerPermission {
+                                    agent_id: agent_id.clone(),
+                                    channel_id: channel_id.as_deref().map(|s| s.to_string()),
+                                    worker_id: worker_id.to_string(),
+                                    permission_id: permission_id.clone(),
+                                    description: description.clone(),
+                                    patterns: patterns.clone(),
+                                }).ok();
+                            }
+                            ProcessEvent::WorkerQuestion {
+                                worker_id,
+                                channel_id,
+                                question_id,
+                                questions,
+                                ..
+                            } => {
+                                api_tx.send(ApiEvent::WorkerQuestion {
+                                    agent_id: agent_id.clone(),
+                                    channel_id: channel_id.as_deref().map(|s| s.to_string()),
+                                    worker_id: worker_id.to_string(),
+                                    question_id: question_id.clone(),
+                                    questions: questions.clone(),
                                 }).ok();
                             }
                             ProcessEvent::WorkerComplete { worker_id, channel_id, result, .. } => {

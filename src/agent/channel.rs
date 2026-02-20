@@ -910,6 +910,30 @@ impl Channel {
             ProcessEvent::WorkerStatus { worker_id, status, .. } => {
                 run_logger.log_worker_status(*worker_id, status);
             }
+            ProcessEvent::WorkerOutput {
+                worker_id,
+                output,
+                ..
+            } => {
+                run_logger.log_worker_status(*worker_id, "worker produced output");
+
+                let mut history = self.state.history.write().await;
+                let worker_message = format!("[Worker output]: {output}");
+                history.push(rig::message::Message::from(worker_message));
+                should_retrigger = true;
+            }
+            ProcessEvent::WorkerPermission { worker_id, description, .. } => {
+                let status = format!("permission requested: {description}");
+                run_logger.log_worker_status(*worker_id, &status);
+            }
+            ProcessEvent::WorkerQuestion { worker_id, questions, .. } => {
+                let summary = questions
+                    .first()
+                    .and_then(|question| question.question.as_deref().or(question.header.as_deref()))
+                    .unwrap_or("worker asked a question");
+                let status = format!("question asked: {summary}");
+                run_logger.log_worker_status(*worker_id, &status);
+            }
             ProcessEvent::WorkerComplete { worker_id, result, notify, .. } => {
                 run_logger.log_worker_completed(*worker_id, result);
 
@@ -1128,7 +1152,7 @@ async fn spawn_branch(
 /// Check whether the channel has capacity for another worker.
 async fn check_worker_limit(state: &ChannelState) -> std::result::Result<(), AgentError> {
     let max_workers = **state.deps.runtime_config.max_concurrent_workers.load();
-    let workers = state.active_workers.read().await;
+    let workers = state.worker_handles.read().await;
     if workers.len() >= max_workers {
         return Err(AgentError::WorkerLimitReached {
             channel_id: state.channel_id.to_string(),
@@ -1201,6 +1225,18 @@ pub async fn spawn_worker_from_state(
     
     let worker_id = worker.id;
 
+    {
+        let mut status = state.status_block.write().await;
+        status.add_worker(worker_id, &task, false);
+    }
+
+    state.deps.event_tx.send(crate::ProcessEvent::WorkerStarted {
+        agent_id: state.deps.agent_id.clone(),
+        worker_id,
+        channel_id: Some(state.channel_id.clone()),
+        task: task.clone(),
+    }).ok();
+
     let worker_span = tracing::info_span!(
         "worker.run",
         worker_id = %worker_id,
@@ -1216,18 +1252,6 @@ pub async fn spawn_worker_from_state(
     );
 
     state.worker_handles.write().await.insert(worker_id, handle);
-
-    {
-        let mut status = state.status_block.write().await;
-        status.add_worker(worker_id, &task, false);
-    }
-
-    state.deps.event_tx.send(crate::ProcessEvent::WorkerStarted {
-        agent_id: state.deps.agent_id.clone(),
-        worker_id,
-        channel_id: Some(state.channel_id.clone()),
-        task: task.clone(),
-    }).ok();
 
     tracing::info!(worker_id = %worker_id, task = %task, "worker spawned");
     
@@ -1246,10 +1270,10 @@ pub async fn spawn_opencode_worker_from_state(
     interactive: bool,
 ) -> std::result::Result<crate::WorkerId, AgentError> {
     check_worker_limit(state).await?;
-    let task = task.into();
-    let directory = std::path::PathBuf::from(directory);
-
     let rc = &state.deps.runtime_config;
+    let task = task.into();
+    let directory = resolve_opencode_directory(directory, &rc.workspace_dir)
+        .map_err(AgentError::Other)?;
     let opencode_config = rc.opencode.load();
 
     if !opencode_config.enabled {
@@ -1259,6 +1283,17 @@ pub async fn spawn_opencode_worker_from_state(
     }
 
     let server_pool = rc.opencode_server_pool.clone();
+    let prompt_engine = rc.prompts.load();
+    let worker_system_prompt = prompt_engine
+        .render_worker_prompt(
+            &rc.instance_dir.display().to_string(),
+            &rc.workspace_dir.display().to_string(),
+        )
+        .expect("failed to render worker prompt");
+    let routing = rc.routing.load();
+    let model_name = routing
+        .resolve(ProcessType::Worker, Some("coding"))
+        .to_string();
 
     let worker = if interactive {
         let (worker, input_tx) = crate::opencode::OpenCodeWorker::new_interactive(
@@ -1281,9 +1316,24 @@ pub async fn spawn_opencode_worker_from_state(
             server_pool,
             state.deps.event_tx.clone(),
         )
-    };
+    }
+    .with_system_prompt(worker_system_prompt)
+    .with_model(model_name);
 
     let worker_id = worker.id;
+    let opencode_task = format!("[opencode] {task}");
+
+    {
+        let mut status = state.status_block.write().await;
+        status.add_worker(worker_id, &opencode_task, false);
+    }
+
+    state.deps.event_tx.send(crate::ProcessEvent::WorkerStarted {
+        agent_id: state.deps.agent_id.clone(),
+        worker_id,
+        channel_id: Some(state.channel_id.clone()),
+        task: opencode_task,
+    }).ok();
 
     let worker_span = tracing::info_span!(
         "worker.run",
@@ -1306,22 +1356,88 @@ pub async fn spawn_opencode_worker_from_state(
 
     state.worker_handles.write().await.insert(worker_id, handle);
 
-    let opencode_task = format!("[opencode] {task}");
-    {
-        let mut status = state.status_block.write().await;
-        status.add_worker(worker_id, &opencode_task, false);
-    }
-
-    state.deps.event_tx.send(crate::ProcessEvent::WorkerStarted {
-        agent_id: state.deps.agent_id.clone(),
-        worker_id,
-        channel_id: Some(state.channel_id.clone()),
-        task: opencode_task,
-    }).ok();
-
     tracing::info!(worker_id = %worker_id, task = %task, "OpenCode worker spawned");
 
     Ok(worker_id)
+}
+
+/// Resolve and validate the requested OpenCode working directory.
+///
+/// Accepts a few common shorthand/placeholder forms (`~`, `$HOME`, `/home/user`)
+/// and normalizes them to the current runtime home directory. Relative paths are
+/// resolved against the agent workspace root when that target exists.
+fn resolve_opencode_directory(
+    raw_directory: &str,
+    workspace_dir: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let directory = raw_directory.trim();
+    if directory.is_empty() {
+        anyhow::bail!("OpenCode directory cannot be empty");
+    }
+
+    let mut resolved = std::path::PathBuf::from(directory);
+
+    // Expand common home shorthands and placeholder paths if the provided path
+    // does not already exist as-is.
+    if !resolved.exists() {
+        if let Some(expanded) = expand_opencode_directory_alias(directory) {
+            tracing::info!(
+                original = directory,
+                expanded = %expanded.display(),
+                "expanded OpenCode directory alias"
+            );
+            resolved = expanded;
+        }
+    }
+
+    // Resolve relative paths against the workspace when possible.
+    if resolved.is_relative() {
+        let workspace_resolved = workspace_dir.join(&resolved);
+        if workspace_resolved.exists() {
+            resolved = workspace_resolved;
+        }
+    }
+
+    if !resolved.exists() {
+        anyhow::bail!(
+            "OpenCode directory '{}' does not exist. Use an existing path (for example '{}' or '{}').",
+            resolved.display(),
+            workspace_dir.display(),
+            dirs::home_dir()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<your home directory>".to_string())
+        );
+    }
+
+    if !resolved.is_dir() {
+        anyhow::bail!(
+            "OpenCode directory '{}' is not a directory",
+            resolved.display()
+        );
+    }
+
+    Ok(resolved)
+}
+
+/// Expand common directory aliases used by LLM-generated tasks.
+fn expand_opencode_directory_alias(input: &str) -> Option<std::path::PathBuf> {
+    let home = dirs::home_dir()?;
+
+    if input == "~" || input == "$HOME" || input == "${HOME}" {
+        return Some(home);
+    }
+
+    for prefix in ["~/", "$HOME/", "${HOME}/", "/home/user/", "/Users/user/"] {
+        if let Some(rest) = input.strip_prefix(prefix) {
+            return Some(home.join(rest));
+        }
+    }
+
+    if input == "/home/user" || input == "/Users/user" {
+        return Some(home);
+    }
+
+    None
 }
 
 /// Spawn a future as a tokio task that sends a `WorkerComplete` event on completion.
@@ -1461,8 +1577,14 @@ fn format_user_message(raw_text: &str, message: &InboundMessage) -> String {
 /// channel's workers would leak into sibling channels (e.g. threads).
 fn event_is_for_channel(event: &ProcessEvent, channel_id: &ChannelId) -> bool {
     match event {
+        ProcessEvent::BranchStarted { channel_id: event_channel, .. } => {
+            event_channel == channel_id
+        }
         ProcessEvent::BranchResult { channel_id: event_channel, .. } => {
             event_channel == channel_id
+        }
+        ProcessEvent::WorkerStarted { channel_id: event_channel, .. } => {
+            event_channel.as_ref() == Some(channel_id)
         }
         ProcessEvent::WorkerComplete { channel_id: event_channel, .. } => {
             event_channel.as_ref() == Some(channel_id)
@@ -1470,8 +1592,22 @@ fn event_is_for_channel(event: &ProcessEvent, channel_id: &ChannelId) -> bool {
         ProcessEvent::WorkerStatus { channel_id: event_channel, .. } => {
             event_channel.as_ref() == Some(channel_id)
         }
-        // Status block updates, tool events, etc. — match on agent_id which
-        // is already filtered by the event bus subscription. Let them through.
+        ProcessEvent::WorkerOutput { channel_id: event_channel, .. } => {
+            event_channel.as_ref() == Some(channel_id)
+        }
+        ProcessEvent::WorkerPermission { channel_id: event_channel, .. } => {
+            event_channel.as_ref() == Some(channel_id)
+        }
+        ProcessEvent::WorkerQuestion { channel_id: event_channel, .. } => {
+            event_channel.as_ref() == Some(channel_id)
+        }
+        ProcessEvent::ToolStarted { channel_id: event_channel, .. } => {
+            event_channel.as_ref() == Some(channel_id)
+        }
+        ProcessEvent::ToolCompleted { channel_id: event_channel, .. } => {
+            event_channel.as_ref() == Some(channel_id)
+        }
+        // Agent-scoped events with no channel binding can flow through.
         _ => true,
     }
 }

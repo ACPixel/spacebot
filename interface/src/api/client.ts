@@ -62,6 +62,36 @@ export interface WorkerStatusEvent {
 	status: string;
 }
 
+export interface WorkerPermissionEvent {
+	type: "worker_permission";
+	agent_id: string;
+	channel_id: string | null;
+	worker_id: string;
+	permission_id: string;
+	description: string;
+	patterns: string[];
+}
+
+export interface WorkerQuestionOption {
+	label: string;
+	description: string | null;
+}
+
+export interface WorkerQuestionInfo {
+	question: string | null;
+	header: string | null;
+	options: WorkerQuestionOption[];
+}
+
+export interface WorkerQuestionEvent {
+	type: "worker_question";
+	agent_id: string;
+	channel_id: string | null;
+	worker_id: string;
+	question_id: string;
+	questions: WorkerQuestionInfo[];
+}
+
 export interface WorkerCompletedEvent {
 	type: "worker_completed";
 	agent_id: string;
@@ -110,6 +140,8 @@ export type ApiEvent =
 	| TypingStateEvent
 	| WorkerStartedEvent
 	| WorkerStatusEvent
+	| WorkerPermissionEvent
+	| WorkerQuestionEvent
 	| WorkerCompletedEvent
 	| BranchStartedEvent
 	| BranchCompletedEvent

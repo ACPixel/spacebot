@@ -62,6 +62,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gh \
     && rm -rf /var/lib/apt/lists/*
 
+RUN curl -fsSL https://opencode.ai/install | bash
+
 COPY --from=builder /usr/local/bin/spacebot /usr/local/bin/spacebot
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh

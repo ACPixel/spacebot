@@ -37,9 +37,14 @@ pub enum PartInput {
 
 /// Model selection for a prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ModelParam {
+    /// OpenCode expects `providerID` casing on modern endpoints.
+    /// Accept `providerId` too for compatibility when deserializing.
+    #[serde(rename = "providerID", alias = "providerId")]
     pub provider_id: String,
+    /// OpenCode expects `modelID` casing on modern endpoints.
+    /// Accept `modelId` too for compatibility when deserializing.
+    #[serde(rename = "modelID", alias = "modelId")]
     pub model_id: String,
 }
 
@@ -166,7 +171,7 @@ pub enum SseEvent {
         session_id: String,
         status: SessionStatusPayload,
     },
-    PermissionAsked(PermissionRequest),
+    PermissionRequested(PermissionRequest),
     PermissionReplied {
         session_id: String,
         request_id: String,
@@ -211,11 +216,13 @@ impl SseEvent {
                 Err(_) => SseEvent::Unknown("session.idle (parse error)".into()),
             },
             "session.error" => {
+                let raw_props = props.clone();
                 let p = serde_json::from_value::<SessionErrorProps>(props).unwrap_or_default();
-                SseEvent::SessionError {
-                    session_id: p.session_id,
-                    error: p.error,
-                }
+                let session_id = p.session_id.clone();
+                let error = p
+                    .error_payload()
+                    .or_else(|| (!raw_props.is_null()).then_some(raw_props));
+                SseEvent::SessionError { session_id, error }
             }
             "session.status" => match serde_json::from_value::<SessionStatusProps>(props) {
                 Ok(p) => SseEvent::SessionStatus {
@@ -224,16 +231,22 @@ impl SseEvent {
                 },
                 Err(_) => SseEvent::Unknown("session.status (parse error)".into()),
             },
-            "permission.asked" => match serde_json::from_value::<PermissionRequest>(props) {
-                Ok(p) => SseEvent::PermissionAsked(p),
-                Err(_) => SseEvent::Unknown("permission.asked (parse error)".into()),
-            },
+            "permission.asked" | "permission.updated" => {
+                match serde_json::from_value::<PermissionRequest>(props) {
+                    Ok(p) => SseEvent::PermissionRequested(p),
+                    Err(_) => SseEvent::Unknown("permission.updated (parse error)".into()),
+                }
+            }
             "permission.replied" => match serde_json::from_value::<PermissionRepliedProps>(props) {
-                Ok(p) => SseEvent::PermissionReplied {
-                    session_id: p.session_id,
-                    request_id: p.request_id,
-                    reply: p.reply,
-                },
+                Ok(p) => {
+                    let request_id = p.request_id();
+                    let reply = p.reply();
+                    SseEvent::PermissionReplied {
+                        session_id: p.session_id,
+                        request_id,
+                        reply,
+                    }
+                }
                 Err(_) => SseEvent::Unknown("permission.replied (parse error)".into()),
             },
             "question.asked" => match serde_json::from_value::<QuestionRequest>(props) {
@@ -279,6 +292,37 @@ struct SessionErrorProps {
     session_id: Option<String>,
     #[serde(default)]
     error: Option<serde_json::Value>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    detail: Option<serde_json::Value>,
+}
+
+impl SessionErrorProps {
+    fn error_payload(self) -> Option<serde_json::Value> {
+        if let Some(error) = self.error {
+            return Some(error);
+        }
+
+        if self.message.is_none() && self.code.is_none() && self.detail.is_none() {
+            return None;
+        }
+
+        let mut object = serde_json::Map::new();
+        if let Some(message) = self.message {
+            object.insert("message".to_string(), serde_json::Value::String(message));
+        }
+        if let Some(code) = self.code {
+            object.insert("code".to_string(), serde_json::Value::String(code));
+        }
+        if let Some(detail) = self.detail {
+            object.insert("detail".to_string(), detail);
+        }
+
+        Some(serde_json::Value::Object(object))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,9 +336,32 @@ struct SessionStatusProps {
 struct PermissionRepliedProps {
     #[serde(rename = "sessionID")]
     session_id: String,
-    #[serde(rename = "requestID")]
-    request_id: String,
-    reply: String,
+    #[serde(rename = "requestID", default)]
+    request_id: Option<String>,
+    #[serde(rename = "permissionID", default)]
+    permission_id: Option<String>,
+    #[serde(default)]
+    reply: Option<String>,
+    #[serde(default)]
+    response: Option<String>,
+}
+
+impl PermissionRepliedProps {
+    fn request_id(&self) -> String {
+        self.request_id
+            .as_ref()
+            .or(self.permission_id.as_ref())
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn reply(&self) -> String {
+        self.reply
+            .as_ref()
+            .or(self.response.as_ref())
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -452,10 +519,63 @@ pub struct PermissionRequest {
     pub session_id: String,
     #[serde(default)]
     pub permission: Option<String>,
+    #[serde(rename = "type", default)]
+    pub permission_type: Option<String>,
     #[serde(default)]
     pub patterns: Vec<String>,
     #[serde(default)]
+    pub pattern: Option<PermissionPattern>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
+}
+
+impl PermissionRequest {
+    /// Permission category, normalized across OpenCode event versions.
+    pub fn kind(&self) -> &str {
+        self.permission
+            .as_deref()
+            .or(self.permission_type.as_deref())
+            .unwrap_or("unknown")
+    }
+
+    /// Pattern list normalized across old (`patterns`) and new (`pattern`) payloads.
+    pub fn pattern_list(&self) -> Vec<String> {
+        if !self.patterns.is_empty() {
+            return self.patterns.clone();
+        }
+
+        match &self.pattern {
+            Some(PermissionPattern::Single(pattern)) => vec![pattern.clone()],
+            Some(PermissionPattern::Multiple(patterns)) => patterns.clone(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Human-readable summary suitable for status updates.
+    pub fn summary(&self) -> String {
+        if let Some(title) = &self.title {
+            if !title.trim().is_empty() {
+                return title.trim().to_string();
+            }
+        }
+
+        let patterns = self.pattern_list();
+        if patterns.is_empty() {
+            self.kind().to_string()
+        } else {
+            format!("{}: {}", self.kind(), patterns.join(", "))
+        }
+    }
+}
+
+/// Permission pattern payload from OpenCode (`pattern` can be string or array).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PermissionPattern {
+    Single(String),
+    Multiple(Vec<String>),
 }
 
 /// Question request from OpenCode.
@@ -531,6 +651,17 @@ impl OpenCodeEnvConfig {
             lsp: false,
             formatter: false,
             permission: permissions.clone(),
+        }
+    }
+}
+
+impl PermissionReply {
+    /// Serialize reply value for OpenCode's modern session permission endpoint.
+    pub fn as_api_str(&self) -> &'static str {
+        match self {
+            PermissionReply::Once => "once",
+            PermissionReply::Always => "always",
+            PermissionReply::Reject => "reject",
         }
     }
 }

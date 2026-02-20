@@ -10,6 +10,8 @@ import {
 	type ToolStartedEvent,
 	type TypingStateEvent,
 	type WorkerCompletedEvent,
+	type WorkerPermissionEvent,
+	type WorkerQuestionEvent,
 	type WorkerStartedEvent,
 	type WorkerStatusEvent,
 	type ChannelInfo,
@@ -340,6 +342,103 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 		}
 	}, [updateItem]);
 
+	const handleWorkerPermission = useCallback((data: unknown) => {
+		const event = data as WorkerPermissionEvent;
+		const status = `permission: ${event.description}`;
+
+		if (event.channel_id) {
+			setLiveStates((prev) => {
+				const state = prev[event.channel_id!];
+				const worker = state?.workers[event.worker_id];
+				if (!worker) return prev;
+				return {
+					...prev,
+					[event.channel_id!]: {
+						...state,
+						workers: {
+							...state.workers,
+							[event.worker_id]: { ...worker, status, currentTool: null },
+						},
+					},
+				};
+			});
+			updateItem(event.channel_id, event.worker_id, (item) => {
+				if (item.type !== "worker_run") return item;
+				return { ...item, status };
+			});
+			return;
+		}
+
+		setLiveStates((prev) => {
+			for (const [channelId, state] of Object.entries(prev)) {
+				const worker = state.workers[event.worker_id];
+				if (!worker) continue;
+				return {
+					...prev,
+					[channelId]: {
+						...state,
+						workers: {
+							...state.workers,
+							[event.worker_id]: { ...worker, status, currentTool: null },
+						},
+					},
+				};
+			}
+			return prev;
+		});
+	}, [updateItem]);
+
+	const handleWorkerQuestion = useCallback((data: unknown) => {
+		const event = data as WorkerQuestionEvent;
+		const firstQuestion = event.questions[0];
+		const prompt =
+			firstQuestion?.header ||
+			firstQuestion?.question ||
+			"worker question pending";
+		const status = `question: ${prompt}`;
+
+		if (event.channel_id) {
+			setLiveStates((prev) => {
+				const state = prev[event.channel_id!];
+				const worker = state?.workers[event.worker_id];
+				if (!worker) return prev;
+				return {
+					...prev,
+					[event.channel_id!]: {
+						...state,
+						workers: {
+							...state.workers,
+							[event.worker_id]: { ...worker, status, currentTool: null },
+						},
+					},
+				};
+			});
+			updateItem(event.channel_id, event.worker_id, (item) => {
+				if (item.type !== "worker_run") return item;
+				return { ...item, status };
+			});
+			return;
+		}
+
+		setLiveStates((prev) => {
+			for (const [channelId, state] of Object.entries(prev)) {
+				const worker = state.workers[event.worker_id];
+				if (!worker) continue;
+				return {
+					...prev,
+					[channelId]: {
+						...state,
+						workers: {
+							...state.workers,
+							[event.worker_id]: { ...worker, status, currentTool: null },
+						},
+					},
+				};
+			}
+			return prev;
+		});
+	}, [updateItem]);
+
 	const handleBranchStarted = useCallback((data: unknown) => {
 		const event = data as BranchStartedEvent;
 
@@ -609,6 +708,8 @@ export function useChannelLiveState(channels: ChannelInfo[]) {
 		typing_state: handleTypingState,
 		worker_started: handleWorkerStarted,
 		worker_status: handleWorkerStatus,
+		worker_permission: handleWorkerPermission,
+		worker_question: handleWorkerQuestion,
 		worker_completed: handleWorkerCompleted,
 		branch_started: handleBranchStarted,
 		branch_completed: handleBranchCompleted,

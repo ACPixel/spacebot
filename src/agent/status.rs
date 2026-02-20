@@ -67,6 +67,55 @@ impl StatusBlock {
                     worker.status.clone_from(status);
                 }
             }
+            ProcessEvent::WorkerOutput {
+                worker_id, output, ..
+            } => {
+                if let Some(worker) = self.active_workers.iter_mut().find(|w| w.id == *worker_id) {
+                    let mut text = format!("output ready: {}", output);
+                    if text.len() > 256 {
+                        let end = text.floor_char_boundary(256);
+                        let boundary = text[..end].rfind(char::is_whitespace).unwrap_or(end);
+                        text = format!("{}...", &text[..boundary]);
+                    }
+                    worker.status = text;
+                }
+            }
+            ProcessEvent::WorkerPermission {
+                worker_id,
+                description,
+                ..
+            } => {
+                if let Some(worker) = self.active_workers.iter_mut().find(|w| w.id == *worker_id) {
+                    let mut text = format!("permission requested: {description}");
+                    if text.len() > 256 {
+                        let end = text.floor_char_boundary(256);
+                        let boundary = text[..end].rfind(char::is_whitespace).unwrap_or(end);
+                        text = format!("{}...", &text[..boundary]);
+                    }
+                    worker.status = text;
+                }
+            }
+            ProcessEvent::WorkerQuestion {
+                worker_id,
+                questions,
+                ..
+            } => {
+                if let Some(worker) = self.active_workers.iter_mut().find(|w| w.id == *worker_id) {
+                    let summary = questions
+                        .first()
+                        .and_then(|question| {
+                            question.question.as_deref().or(question.header.as_deref())
+                        })
+                        .unwrap_or("worker asked a question");
+                    let mut text = format!("question asked: {summary}");
+                    if text.len() > 256 {
+                        let end = text.floor_char_boundary(256);
+                        let boundary = text[..end].rfind(char::is_whitespace).unwrap_or(end);
+                        text = format!("{}...", &text[..boundary]);
+                    }
+                    worker.status = text;
+                }
+            }
             ProcessEvent::WorkerComplete {
                 worker_id,
                 result,

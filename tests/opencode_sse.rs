@@ -13,6 +13,51 @@ fn parse_sse_line(line: &str) -> SseEvent {
 }
 
 #[test]
+fn serialize_model_param_uses_opencode_id_keys() {
+    let request = SendPromptRequest {
+        parts: vec![PartInput::Text {
+            text: "test".to_string(),
+            synthetic: None,
+        }],
+        system: None,
+        model: Some(ModelParam {
+            provider_id: "openrouter".to_string(),
+            model_id: "anthropic/claude-haiku-4.5".to_string(),
+        }),
+        agent: None,
+    };
+
+    let value = serde_json::to_value(&request).expect("request should serialize");
+    let model = value
+        .get("model")
+        .and_then(|v| v.as_object())
+        .expect("serialized request should include model object");
+
+    assert_eq!(
+        model.get("providerID").and_then(|v| v.as_str()),
+        Some("openrouter")
+    );
+    assert_eq!(
+        model.get("modelID").and_then(|v| v.as_str()),
+        Some("anthropic/claude-haiku-4.5")
+    );
+    assert!(model.get("providerId").is_none());
+    assert!(model.get("modelId").is_none());
+}
+
+#[test]
+fn deserialize_model_param_accepts_legacy_camel_case_keys() {
+    let value = serde_json::json!({
+        "providerId": "openrouter",
+        "modelId": "anthropic/claude-haiku-4.5"
+    });
+
+    let model: ModelParam = serde_json::from_value(value).expect("model should deserialize");
+    assert_eq!(model.provider_id, "openrouter");
+    assert_eq!(model.model_id, "anthropic/claude-haiku-4.5");
+}
+
+#[test]
 fn parse_server_connected() {
     let event = parse_sse_line(r#"data: {"type":"server.connected","properties":{}}"#);
     assert!(matches!(event, SseEvent::Unknown(ref s) if s == "server.connected"));
@@ -220,6 +265,92 @@ fn parse_session_error() {
             assert_eq!(msg, "something broke");
         }
         other => panic!("expected SessionError, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_session_error_with_top_level_message() {
+    let event = parse_sse_line(
+        r#"data: {"type":"session.error","properties":{"sessionID":"ses_456","message":"provider request failed"}}"#,
+    );
+    match event {
+        SseEvent::SessionError { session_id, error } => {
+            assert_eq!(session_id.as_deref(), Some("ses_456"));
+            let msg = error
+                .unwrap()
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(msg, "provider request failed");
+        }
+        other => panic!("expected SessionError, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_session_error_with_string_payload() {
+    let event = parse_sse_line(
+        r#"data: {"type":"session.error","properties":{"sessionID":"ses_456","error":"request denied"}}"#,
+    );
+    match event {
+        SseEvent::SessionError { session_id, error } => {
+            assert_eq!(session_id.as_deref(), Some("ses_456"));
+            let payload = error.unwrap();
+            assert_eq!(payload.as_str(), Some("request denied"));
+        }
+        other => panic!("expected SessionError, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_permission_updated_new_shape() {
+    let event = parse_sse_line(
+        r#"data: {"type":"permission.updated","properties":{"id":"perm_1","type":"bash","pattern":"rm -rf *","sessionID":"ses_456","messageID":"msg_789","title":"Run shell command","metadata":{},"time":{"created":1234}}}"#,
+    );
+    match event {
+        SseEvent::PermissionRequested(permission) => {
+            assert_eq!(permission.id, "perm_1");
+            assert_eq!(permission.session_id, "ses_456");
+            assert_eq!(permission.kind(), "bash");
+            assert_eq!(permission.pattern_list(), vec!["rm -rf *".to_string()]);
+            assert_eq!(permission.summary(), "Run shell command");
+        }
+        other => panic!("expected PermissionRequested, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_permission_asked_legacy_shape() {
+    let event = parse_sse_line(
+        r#"data: {"type":"permission.asked","properties":{"id":"perm_old","sessionID":"ses_456","permission":"bash","patterns":["ls -la"],"metadata":{}}}"#,
+    );
+    match event {
+        SseEvent::PermissionRequested(permission) => {
+            assert_eq!(permission.id, "perm_old");
+            assert_eq!(permission.kind(), "bash");
+            assert_eq!(permission.pattern_list(), vec!["ls -la".to_string()]);
+        }
+        other => panic!("expected PermissionRequested, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_permission_replied_new_shape() {
+    let event = parse_sse_line(
+        r#"data: {"type":"permission.replied","properties":{"sessionID":"ses_456","permissionID":"perm_1","response":"once"}}"#,
+    );
+    match event {
+        SseEvent::PermissionReplied {
+            session_id,
+            request_id,
+            reply,
+        } => {
+            assert_eq!(session_id, "ses_456");
+            assert_eq!(request_id, "perm_1");
+            assert_eq!(reply, "once");
+        }
+        other => panic!("expected PermissionReplied, got {other:?}"),
     }
 }
 

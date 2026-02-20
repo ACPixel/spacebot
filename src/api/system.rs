@@ -1,8 +1,8 @@
 use super::state::{ApiEvent, ApiState};
 
+use axum::Json;
 use axum::extract::State;
 use axum::response::Sse;
-use axum::Json;
 use futures::stream::Stream;
 use serde::Serialize;
 use std::convert::Infallible;
@@ -79,6 +79,8 @@ pub(super) async fn events_sse(
                             ApiEvent::TypingState { .. } => "typing_state",
                             ApiEvent::WorkerStarted { .. } => "worker_started",
                             ApiEvent::WorkerStatusUpdate { .. } => "worker_status",
+                            ApiEvent::WorkerPermission { .. } => "worker_permission",
+                            ApiEvent::WorkerQuestion { .. } => "worker_question",
                             ApiEvent::WorkerCompleted { .. } => "worker_completed",
                             ApiEvent::BranchStarted { .. } => "branch_started",
                             ApiEvent::BranchCompleted { .. } => "branch_completed",

@@ -21,6 +21,9 @@ const TURNS_PER_SEGMENT: usize = 25;
 /// Prevents infinite compact-retry loops if something is fundamentally wrong.
 const MAX_OVERFLOW_RETRIES: usize = 3;
 
+/// How long an interactive worker waits for follow-up before auto-completing.
+const INTERACTIVE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Worker state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerState {
@@ -201,7 +204,7 @@ impl Worker {
         let mut segments_run = 0;
         let mut overflow_retries = 0;
 
-        let result = loop {
+        let mut latest_result = loop {
             segments_run += 1;
 
             match agent.prompt(&prompt)
@@ -266,10 +269,20 @@ impl Worker {
 
         // For interactive workers, enter a follow-up loop
         if let Some(mut input_rx) = self.input_rx.take() {
+            self.emit_worker_output(&latest_result);
             self.state = WorkerState::WaitingForInput;
             self.hook.send_status("waiting for input");
 
-            while let Some(follow_up) = input_rx.recv().await {
+            loop {
+                let follow_up = match tokio::time::timeout(INTERACTIVE_IDLE_TIMEOUT, input_rx.recv()).await {
+                    Ok(Some(message)) => message,
+                    Ok(None) => break,
+                    Err(_) => {
+                        self.hook.send_status("no follow-up received, finishing");
+                        break;
+                    }
+                };
+
                 self.state = WorkerState::Running;
                 self.hook.send_status("processing follow-up");
 
@@ -285,7 +298,10 @@ impl Worker {
                         .with_hook(self.hook.clone())
                         .await
                     {
-                        Ok(_response) => break true,
+                        Ok(response) => {
+                            latest_result = response;
+                            break true
+                        }
                         Err(error) if is_context_overflow_error(&error.to_string()) => {
                             follow_up_overflow_retries += 1;
                             if follow_up_overflow_retries > MAX_OVERFLOW_RETRIES {
@@ -316,6 +332,7 @@ impl Worker {
                 };
 
                 if follow_up_ok {
+                    self.emit_worker_output(&latest_result);
                     self.state = WorkerState::WaitingForInput;
                     self.hook.send_status("waiting for input");
                 } else {
@@ -336,7 +353,20 @@ impl Worker {
         }
         
         tracing::info!(worker_id = %self.id, "worker completed");
-        Ok(result)
+        Ok(latest_result)
+    }
+
+    fn emit_worker_output(&self, output: &str) {
+        if output.trim().is_empty() {
+            return;
+        }
+
+        let _ = self.deps.event_tx.send(crate::ProcessEvent::WorkerOutput {
+            agent_id: self.deps.agent_id.clone(),
+            worker_id: self.id,
+            channel_id: self.channel_id.clone(),
+            output: output.to_string(),
+        });
     }
 
     /// Check context usage and compact history if approaching the limit.
